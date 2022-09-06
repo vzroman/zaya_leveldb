@@ -2,41 +2,108 @@
 -module(zaya_leveldb).
 
 -define(DEFAULT_ELEVELDB_OPTIONS,#{
-  
+  %compression_algorithm => todo,
+  open_options=>#{
+    create_if_missing => false,
+    error_if_exists => false,
+    %write_buffer_size => todo
+    %sst_block_size => todo,
+    %block_restart_interval = todo,
+    %block_size_steps => todo,
+    paranoid_checks => false,
+    verify_compactions => false
+    %compression => todo,
+    %use_bloomfilter => todo,
+    %total_memory => todo,
+    %total_leveldb_mem => todo,
+    %total_leveldb_mem_percent => todo,
+    %is_internal_db => todo,
+    %limited_developer_mem => todo,
+    %eleveldb_threads => TODO pos_integer()
+    %fadvise_willneed => TODO boolean()
+    %block_cache_threshold => TODO pos_integer()
+    %delete_threshold => pos_integer()
+    %tiered_slow_level => pos_integer()
+    %tiered_fast_prefix => TODO string()
+    %tiered_slow_prefix => TODO string()
+    %cache_object_warming => TODO
+    %expiry_enabled => TODO boolean()
+    %expiry_minutes => TODO pos_integer()
+    %whole_file_expiry => boolean()
+  },
+  read => #{
+    verify_checksums => false
+    %fill_cache => todo,
+    %iterator_refresh =todo
+  },
+  write => #{
+    sync => false
+  }
 }).
+
+-define(OPTIONS(O),
+  maps:merge(
+    maps:merge(
+      ?DEFAULT_ELEVELDB_OPTIONS,
+      maps:from_list(application:get_all_env(zaya_leveldb))
+    ),
+  O)
+).
+
 -define(EXT,"leveldb").
 -define(LOCK(P),P++"/LOCK").
 
--define(REF(T),mnesia_eleveldb:get_ref(T)).
--define(DECODE_KEY(K),mnesia_eleveldb:decode_key(K)).
--define(ENCODE_KEY(K),mnesia_eleveldb:encode_key(K)).
--define(DECODE_VALUE(V),element(3,mnesia_eleveldb:decode_val(V))).
--define(ENCODE_VALUE(V),mnesia_eleveldb:encode_val({[],[],V})).
+-define(DECODE_KEY(K), sext:decode(K) ).
+-define(ENCODE_KEY(K), sext:encode(K) ).
+-define(DECODE_VALUE(V), binary_to_term(V) ).
+-define(ENCODE_VALUE(V), term_to_binary(V) ).
 
 -define(MOVE(I,K),eleveldb:iterator_move(I,K)).
 -define(NEXT(I),eleveldb:iterator_move(I,next)).
 -define(PREV(I),eleveldb:iterator_move(I,prev)).
 
-% The encoded @deleted@ value. Actually this is {[],[],'@deleted@'}
--define(DELETED, <<131,104,3,106,106,100,0,9,64,100,101,108,101,116,101,100,64>>).
 -define(MAX_SEARCH_SIZE,1 bsl 128).
 
+-ifndef(TEST).
+
+-define(LOGERROR(Text),lager:error(Text)).
+-define(LOGERROR(Text,Params),lager:error(Text,Params)).
+-define(LOGWARNING(Text),lager:warning(Text)).
+-define(LOGWARNING(Text,Params),lager:warning(Text,Params)).
+-define(LOGINFO(Text),lager:info(Text)).
+-define(LOGINFO(Text,Params),lager:info(Text,Params)).
+-define(LOGDEBUG(Text),lager:debug(Text)).
+-define(LOGDEBUG(Text,Params),lager:debug(Text,Params)).
+
+-else.
+
+-define(LOGERROR(Text),ct:pal("error: "++Text)).
+-define(LOGERROR(Text,Params),ct:pal("error: "++Text,Params)).
+-define(LOGWARNING(Text),ct:pal("warning: "++Text)).
+-define(LOGWARNING(Text,Params),ct:pal("warning: "++Text,Params)).
+-define(LOGINFO(Text),ct:pal("info: "++Text)).
+-define(LOGINFO(Text,Params),ct:pal("info: "++Text,Params)).
+-define(LOGDEBUG(Text),ct:pal("debug: "++Text)).
+-define(LOGDEBUG(Text,Params),ct:pal("debug: "++Text,Params)).
+
+-endif.
+
 %%=================================================================
-%%	STORAGE SERVER API
+%%	SERVICE API
 %%=================================================================
 -export([
-  ext/0,
-  create/2,
-  open/2,
-  close/1
+  create/1,
+  open/1,
+  close/1,
+  remove/1
 ]).
 
 %%=================================================================
-%%	GET/PUT API
+%%	LOW_LEVEL API
 %%=================================================================
 -export([
-  read/2,
-  write/2,
+  get/2,
+  put/2,
   delete/2
 ]).
 
@@ -51,11 +118,12 @@
 ]).
 
 %%=================================================================
-%%	SEARCH API
+%%	HIGH-LEVEL API
 %%=================================================================
 -export([
-  search/2,
-  match/2
+  find/2,
+  foldl/4,
+  foldr/4
 ]).
 
 %%=================================================================
@@ -69,84 +137,60 @@
 %%	COPY API
 %%=================================================================
 -export([
-  init_source/2,
-  init_target/2,
-  init_copy/1,
 
-  dump_source/1,
-  dump_target/1,
-  rollback_copy/1,
-
-  fold/3,
-
-  write_batch/2,
-  drop_batch/2,
-
-  get_key/1,
-  decode_key/1,
-
-  action/1,
-  live_action/1
 ]).
 
--define(DEFAULT_PARAMS,#{
-  options => ?DEFAULT_ELEVELDB_OPTIONS,
-  attempts => 5
-}).
--define(PARAMS(P),maps:merge(?DEFAULT_PARAMS,P)).
-
 %%=================================================================
-%%	STORAGE SERVER
+%%	SERVICE
 %%=================================================================
-ext()->
-  ?EXT.
+create( Params )->
+  #{
+    dir := Dir
+  } = ?OPTIONS( Params ),
 
-check_params(Params)->
-  todo.
+  Path = Dir ++"."++?EXT,
 
-create( Segment, #{
-  path := Path
-})->
-  SPath = ?S_PATH(Path,Segment,?EXT_ELEVELDB),
-
-  case filelib:is_dir(SPath) of
+  case filelib:is_dir( Path ) of
     false->
-      case filelib:is_file(SPath) of
-        false->ok;
-        true->
-          ?LOGERROR("~p creaate error ~p already exists, try to remove it first",[Segment,SPath]),
-          throw(not_empty)
-      end;
+      ok;
     true->
-      ?LOGERROR("~p create error ~p already exists, try to remove it first",[Segment,SPath]),
-      throw(not_empty)
+      ?LOGERROR("~s directory already exists, try to remove it first",[Path]),
+      throw(dir_already_exists)
   end,
 
-  case filelib:ensure_dir( SPath ) of
+  case filelib:is_file( Path ) of
+    false->
+      ok;
+    true->
+      ?LOGERROR("~s file already exists, try to remove it first",[Path]),
+      throw(dir_is_file)
+  end,
+
+  case filelib:ensure_dir( Path ) of
     ok->ok;
     {error, Error}->
-      ?LOGERROR("~p create error ~p unable create error ~p",[Segment,SPath,Error]),
-      throw(unavailable_path)
+      ?LOGERROR("~s unable create error ~p",[Path,Error]),
+      throw(unavailable_dir)
   end,
 
   ok.
 
-open( Segment, Params0 )->
-  Params = #{
-    path:=Path
-  } = ?PARAMS( Params0 ),
+open( Params)->
+  Options = #{
+    dir := Dir
+  } = ?OPTIONS( Params ),
 
-  SPath = ?S_PATH(Path,Segment,?EXT_ELEVELDB),
+  Path = Dir ++"."++?EXT,
 
-  case filelib:is_dir(SPath) of
-    false->
-      ?LOGERROR("~p doesn't exist"),
-      throw(not_exists);
+  case filelib:is_dir( Path ) of
     true->
-      ok
+      ok;
+    false->
+      ?LOGERROR("~s doesn't exist",[ Path ]),
+      throw(not_exists)
   end,
 
-  try_open(Segment, SPath, Params).
+  try_open(Path, Options).
 
 try_open(Segment, Path, #{
   options := Options,
