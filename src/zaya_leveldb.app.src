@@ -1,0 +1,14 @@
+{application, zaya_leveldb,
+ [{description, "LevelDb driver for zaya"},
+  {vsn, git},
+  {registered, []},
+  {applications,
+   [kernel,
+    stdlib
+   ]},
+  {env,[]},
+  {modules, []},
+
+  {licenses, ["MIT"]},
+  {links, []}
+ ]}.
