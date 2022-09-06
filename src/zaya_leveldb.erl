@@ -1,6 +1,8 @@
 
 -module(zaya_leveldb).
 
+-define(DEFAULT_OPEN_ATTEMPTS, 5).
+
 -define(DEFAULT_ELEVELDB_OPTIONS,#{
   %compression_algorithm => todo,
   open_options=>#{
@@ -40,14 +42,13 @@
     sync => false
   }
 }).
+-define(env(K,D), application:get_env(zaya_leveldb,K,D)).
 
 -define(OPTIONS(O),
-  maps:merge(
-    maps:merge(
-      ?DEFAULT_ELEVELDB_OPTIONS,
-      maps:from_list(application:get_all_env(zaya_leveldb))
-    ),
-  O)
+  #{
+    open_attempts => ?env(open_attempts,?DEFAULT_OPEN_ATTEMPTS),
+    eleveldb => ?env(eleveldb,?DEFAULT_ELEVELDB_OPTIONS)
+  }
 ).
 
 -define(EXT,"leveldb").
@@ -144,7 +145,7 @@
 %%	SERVICE
 %%=================================================================
 create( Params )->
-  #{
+  Options = #{
     dir := Dir
   } = ?OPTIONS( Params ),
 
@@ -172,6 +173,8 @@ create( Params )->
       ?LOGERROR("~s unable create error ~p",[Path,Error]),
       throw(unavailable_dir)
   end,
+
+  try_open( Options#{  } ),
 
   ok.
 
