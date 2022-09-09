@@ -47,8 +47,8 @@
 
 -define(OPTIONS(O),
   #{
-    open_attempts => ?env(open_attempts,?DEFAULT_OPEN_ATTEMPTS),
-    eleveldb => ?env(eleveldb,?DEFAULT_ELEVELDB_OPTIONS)
+    open_attempts => maps:get(open_attempts,O, ?env(open_attempts,?DEFAULT_OPEN_ATTEMPTS) ) ,
+    eleveldb =>maps:get(eleveldb,O, ?env(eleveldb,?DEFAULT_ELEVELDB_OPTIONS) )
   }
 ).
 
@@ -142,7 +142,7 @@
 
 ]).
 
--record(ref,{ref,read,write}).
+-record(ref,{ref,read,write,dir}).
 
 %%=================================================================
 %%	SERVICE
@@ -211,7 +211,12 @@ try_open(Path, #{
         read := Read,
         write := Write
       } = Params,
-      #ref{ ref = Ref, read = maps:to_list(Read), write = maps:to_list(Write) };
+      #ref{
+        ref = Ref,
+        read = maps:to_list(Read),
+        write = maps:to_list(Write),
+        dir = Path
+      };
     %% Check for open errors
     {error, {db_open, Error}} ->
       % Check for hanging lock
@@ -386,120 +391,211 @@ prev( #ref{ref = Ref, read = Params}, K )->
 %%=================================================================
 %%	HIGH-LEVEL API
 %%=================================================================
--record(query,{start, stop, ms}).
+%----------------------FIND------------------------------------------
 find(#ref{ref = Ref, read = Params}, Query)->
+  StartKey =
+    case Query of
+      #{start := Start}-> ?ENCODE_KEY(Start);
+      _->first
+    end,
 
-  ok.
-
-match( Segment, Pattern )->
-  ok.
-
-%----------------------DISC SCAN ALL TABLE, NO LIMIT-----------------------------------------
-disc_scan(Segment,'$start_of_table','$end_of_table',Limit)
-  when not is_number(Limit)->
-  ?LOGDEBUG("------------DISC SCAN ALL TABLE, NO LIMIT-------------"),
-  fold(Segment,fun(I)-> do_fold(?MOVE(I,?DATA_START),I) end);
-
-%----------------------DISC SCAN ALL TABLE, WITH LIMIT-----------------------------------------
-disc_scan(Segment,'$start_of_table','$end_of_table',Limit)->
-  ?LOGDEBUG("------------DISC SCAN ALL TABLE, LIMIT ~p-------------",[Limit]),
-  fold(Segment,fun(I)-> do_fold(?MOVE(I,?DATA_START),I,Limit) end);
-
-%----------------------DISC SCAN FROM START TO KEY, NO LIMIT-----------------------------------------
-disc_scan(Segment,'$start_of_table',To,Limit)
-  when not is_number(Limit)->
-  ?LOGDEBUG("------------DISC SCAN FROM START TO KEY ~p, NO LIMIT-------------",[To]),
-  fold(Segment,fun(I)-> do_fold_to(?MOVE(I,?DATA_START),I,?ENCODE_KEY(To)) end);
-
-%----------------------DISC SCAN FROM START TO KEY, WITH LIMIT-----------------------------------------
-disc_scan(Segment,'$start_of_table',To,Limit)->
-  ?LOGDEBUG("------------DISC SCAN FROM START TO KEY ~p, WITH LIMIT ~p-------------",[To,Limit]),
-  fold(Segment,fun(I)-> do_fold_to(?MOVE(I,?DATA_START),I,?ENCODE_KEY(To),Limit) end);
-
-%----------------------DISC SCAN FROM KEY TO END, NO LIMIT-----------------------------------------
-disc_scan(Segment,From,'$end_of_table',Limit)
-  when not is_number(Limit)->
-  ?LOGDEBUG("------------DISC SCAN FROM ~p TO END, NO LIMIT-------------",[From]),
-  fold(Segment,fun(I)-> do_fold(?MOVE(I,?ENCODE_KEY(From)),I) end);
-
-%----------------------DISC SCAN FROM KEY TO END, WITH LIMIT-----------------------------------------
-disc_scan(Segment,From,'$end_of_table',Limit)->
-  ?LOGDEBUG("------------DISC SCAN FROM ~p TO END, WITH LIMIT ~p-------------",[From,Limit]),
-  fold(Segment,fun(I)-> do_fold(?MOVE(I,?ENCODE_KEY(From)),I,Limit) end);
-
-%----------------------DISC SCAN FROM KEY TO KEY, NO LIMIT-----------------------------------------
-disc_scan(Segment,From,To,Limit)
-  when not is_number(Limit)->
-  ?LOGDEBUG("------------DISC SCAN FROM ~p TO ~p, NO LIMIT-------------",[From,To]),
-  fold(Segment,fun(I)-> do_fold_to(?MOVE(I,?ENCODE_KEY(From)),I,?ENCODE_KEY(To)) end);
-
-%----------------------DISC SCAN FROM KEY TO KEY, WITH LIMIT-----------------------------------------
-disc_scan(Segment,From,To,Limit)->
-  ?LOGDEBUG("------------DISC SCAN FROM ~p TO ~p, WITH LIMIT ~p-------------",[From,To,Limit]),
-  fold(Segment,fun(I)-> do_fold_to(?MOVE(I,?ENCODE_KEY(From)),I,?ENCODE_KEY(To),Limit) end).
-
-fold(Segment,Fold) ->
-  Ref = ?REF(Segment),
-  {ok, Itr} = eleveldb:iterator(Ref, []),
-  try Fold(Itr)
+  {ok, Itr} = eleveldb:iterator(Ref, [{first_key, StartKey}|Params]),
+  try
+    case Query of
+      #{ stop:=Stop, ms:= MS }->
+        StopKey = ?ENCODE_KEY(Stop),
+        CompiledMS = ets:match_spec_compile(MS),
+        iterate_query(eleveldb:iterator_move(Itr, StartKey), Itr, prefetch, StopKey, CompiledMS );
+      #{ stop:= Stop }->
+        iterate_stop(eleveldb:iterator_move(Itr, StartKey), Itr, prefetch, ?ENCODE_KEY(Stop) );
+      #{ms:= MS}->
+        iterate_ms(eleveldb:iterator_move(Itr, StartKey), Itr, prefetch, ets:match_spec_compile(MS) );
+      _->
+        iterate(eleveldb:iterator_move(Itr, StartKey), Itr, prefetch )
+    end
   after
     catch eleveldb:iterator_close(Itr)
   end.
 
+iterate_query({ok,K,V}, Itr, Next, StopKey, MS ) when K =< StopKey->
+  Rec = {?DECODE_KEY(K),?DECODE_VALUE(V) },
+  case ets:match_spec_run([Rec], MS) of
+    [_]->
+      [Rec| iterate_query( eleveldb:iterator_move(Itr,Next), Itr, Next, StopKey, MS )];
+    []->
+      iterate_query( eleveldb:iterator_move(Itr,Next), Itr, Next, StopKey, MS )
+  end;
+iterate_query(_, _Itr, _Next, _StopKey, _MS )->
+  [].
+
+iterate_stop({ok,K,V}, Itr, Next, StopKey ) when K =< StopKey->
+  [{?DECODE_KEY(K),?DECODE_VALUE(V) }| iterate_stop( eleveldb:iterator_move(Itr,Next), Itr, Next, StopKey )];
+iterate_stop(_, _Itr, _Next, _StopKey )->
+  [].
+
+iterate_ms({ok,K,V}, Itr, Next, MS )->
+  Rec = {?DECODE_KEY(K),?DECODE_VALUE(V) },
+  case ets:match_spec_run([Rec], MS) of
+    [_]->
+      [Rec| iterate_ms( eleveldb:iterator_move(Itr,Next), Itr, Next, MS )];
+    []->
+      iterate_ms( eleveldb:iterator_move(Itr,Next), Itr, Next, MS )
+  end;
+iterate_ms(_, _Itr, _Next, _MS )->
+  [].
+
+iterate({ok,K,V}, Itr, Next)->
+  [{?DECODE_KEY(K),?DECODE_VALUE(V) } | iterate( eleveldb:iterator_move(Itr,Next), Itr, Next ) ];
+iterate(_, _Itr, _Next )->
+  [].
+
+%----------------------FOLD LEFT------------------------------------------
+foldl( #ref{ref = Ref, read = Params}, Query, UserFun, InAcc )->
+  StartKey =
+    case Query of
+      #{start := Start}-> ?ENCODE_KEY(Start);
+      _->first
+    end,
+  Fun =
+    case Query of
+      #{ms:=MS}->
+        CompiledMS = ets:match_spec_compile(MS),
+        fun(Rec,Acc)->
+          case ets:match_spec_run([Rec], CompiledMS) of
+            [_]->
+              UserFun(Rec,Acc);
+            []->
+              Acc
+          end
+        end;
+      _->
+        UserFun
+    end,
+
+  {ok, Itr} = eleveldb:iterator(Ref, [{first_key, StartKey}|Params]),
+  try
+    case Query of
+      #{ stop:=Stop }->
+        do_foldl_stop( eleveldb:iterator_move(Itr, StartKey), Itr, Fun, InAcc, ?ENCODE_KEY(Stop) );
+      _->
+        do_foldl( eleveldb:iterator_move(Itr, StartKey), Itr, Fun, InAcc )
+    end
+  after
+    catch eleveldb:iterator_close(Itr)
+  end.
+
+do_foldl_stop( {ok,K,V}, Itr, Fun, InAcc, StopKey ) when K =< StopKey->
+  Acc = Fun( {?DECODE_KEY(K), ?DECODE_VALUE(V)}, InAcc ),
+  do_foldl_stop( eleveldb:iterator_move(Itr,prefetch), Itr, Fun, Acc, StopKey  );
+do_foldl_stop(_, _Itr, _Fun, Acc, _StopKey )->
+  Acc.
+
+do_foldl( {ok,K,V}, Itr, Fun, InAcc )->
+  Acc = Fun( {?DECODE_KEY(K), ?DECODE_VALUE(V)}, InAcc ),
+  do_foldl( eleveldb:iterator_move(Itr,prefetch), Itr, Fun, Acc  );
+do_foldl(_, _Itr, _Fun, Acc )->
+  Acc.
+
+%----------------------FOLD RIGHT------------------------------------------
+foldr( #ref{ref = Ref, read = Params}, Query, UserFun, InAcc )->
+  StartKey =
+    case Query of
+      #{start := Start}-> ?ENCODE_KEY(Start);
+      _->last
+    end,
+  Fun =
+    case Query of
+      #{ms:=MS}->
+        CompiledMS = ets:match_spec_compile(MS),
+        fun(Rec,Acc)->
+          case ets:match_spec_run([Rec], CompiledMS) of
+            [_]->
+              UserFun(Rec,Acc);
+            []->
+              Acc
+          end
+        end;
+      _->
+        UserFun
+    end,
+
+  {ok, Itr} = eleveldb:iterator(Ref, [{first_key, StartKey}|Params]),
+  try
+    case Query of
+      #{ stop:=Stop }->
+        do_foldr_stop( eleveldb:iterator_move(Itr, StartKey), Itr, Fun, InAcc, ?ENCODE_KEY(Stop) );
+      _->
+        do_foldr( eleveldb:iterator_move(Itr, StartKey), Itr, Fun, InAcc )
+    end
+  after
+    catch eleveldb:iterator_close(Itr)
+  end.
+
+do_foldr_stop( {ok,K,V}, Itr, Fun, InAcc, StopKey ) when K >= StopKey->
+  Acc = Fun( {?DECODE_KEY(K), ?DECODE_VALUE(V)}, InAcc ),
+  do_foldr_stop( eleveldb:iterator_move(Itr,prev), Itr, Fun, Acc, StopKey  );
+do_foldr_stop(_, _Itr, _Fun, Acc, _StopKey )->
+  Acc.
+
+do_foldr( {ok,K,V}, Itr, Fun, InAcc )->
+  Acc = Fun( {?DECODE_KEY(K), ?DECODE_VALUE(V)}, InAcc ),
+  do_foldl( eleveldb:iterator_move(Itr,prev), Itr, Fun, Acc  );
+do_foldr(_, _Itr, _Fun, Acc )->
+  Acc.
+
 %%=================================================================
 %%	INFO
 %%=================================================================
-get_size( Table)->
-  get_size( Table, 10 ).
-get_size( Table, Attempts ) when Attempts > 0->
-  MP = mnesia_eleveldb:data_mountpoint( Table ),
-  S = list_to_binary(os:cmd("du -s --block-size=1 "++MP)),
+get_size( Ref )->
+  get_size( Ref, 10 ).
+get_size( #ref{dir = Dir} = R, Attempts ) when Attempts > 0->
+  S = list_to_binary(os:cmd("du -s --block-size=1 "++ Dir)),
   case binary:split(S,<<"\t">>) of
     [Size|_]->
       try binary_to_integer( Size )
       catch _:_->
         % Sometimes du returns error when there are some file transformations
         timer:sleep(200),
-        get_size( Table, Attempts - 1 )
+        get_size( R, Attempts - 1 )
       end;
     _ ->
       timer:sleep(200),
-      get_size( Table, Attempts - 1 )
+      get_size( R, Attempts - 1 )
   end;
-get_size( _Table, 0 )->
+get_size( _R, 0 )->
   -1.
 
 %%=================================================================
 %%	COPY
 %%=================================================================
-fold(#source{ref = Ref}, Iterator, Acc0)->
-  eleveldb:fold(Ref,Iterator, Acc0, [{first_key, first}]).
-
-write_batch(Batch, CopyRef)->
-  eleveldb:write(CopyRef,Batch, [{sync, true}]).
-
-drop_batch(Batch0,#source{ref = Ref})->
-  Batch =
-    [case R of {put,K,_}->{delete,K};_-> R end || R <- Batch0],
-  eleveldb:write(Ref,Batch, [{sync, false}]).
-
-action({K,V})->
-  {{put,K,V},size(K)+size(V)}.
-
-live_action({write, {K,V}})->
-  K1 = ?ENCODE_KEY(K),
-  {K1, {put, K1,?ENCODE_VALUE(V)} };
-live_action({delete,K})->
-  K1 = ?ENCODE_KEY(K),
-  {K1,{delete,K1}}.
-
-get_key({put,K,_V})->K;
-get_key({delete,K})->K.
-
-decode_key(K)->?DECODE_KEY(K).
-
-rollback_copy( Target )->
-  todo.
+%%fold(#source{ref = Ref}, Iterator, Acc0)->
+%%  eleveldb:fold(Ref,Iterator, Acc0, [{first_key, first}]).
+%%
+%%write_batch(Batch, CopyRef)->
+%%  eleveldb:write(CopyRef,Batch, [{sync, true}]).
+%%
+%%drop_batch(Batch0,#source{ref = Ref})->
+%%  Batch =
+%%    [case R of {put,K,_}->{delete,K};_-> R end || R <- Batch0],
+%%  eleveldb:write(Ref,Batch, [{sync, false}]).
+%%
+%%action({K,V})->
+%%  {{put,K,V},size(K)+size(V)}.
+%%
+%%live_action({write, {K,V}})->
+%%  K1 = ?ENCODE_KEY(K),
+%%  {K1, {put, K1,?ENCODE_VALUE(V)} };
+%%live_action({delete,K})->
+%%  K1 = ?ENCODE_KEY(K),
+%%  {K1,{delete,K1}}.
+%%
+%%get_key({put,K,_V})->K;
+%%get_key({delete,K})->K.
+%%
+%%decode_key(K)->?DECODE_KEY(K).
+%%
+%%rollback_copy( Target )->
+%%  todo.
 
 
 
