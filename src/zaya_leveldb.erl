@@ -2,6 +2,7 @@
 -module(zaya_leveldb).
 
 -define(DEFAULT_OPEN_ATTEMPTS, 5).
+-define(DESTROY_ATTEMPTS, 5).
 
 -define(DEFAULT_ELEVELDB_OPTIONS,#{
   %compression_algorithm => todo,
@@ -103,8 +104,8 @@
 %%	LOW_LEVEL API
 %%=================================================================
 -export([
-  get/2,
-  put/2,
+  read/2,
+  write/2,
   delete/2
 ]).
 
@@ -141,6 +142,8 @@
 
 ]).
 
+-record(ref,{ref,read,write}).
+
 %%=================================================================
 %%	SERVICE
 %%=================================================================
@@ -174,11 +177,12 @@ create( Params )->
       throw(unavailable_dir)
   end,
 
-  try_open( Options#{  } ),
+  Ref = try_open(Path, Options),
+  close( Ref ),
 
   ok.
 
-open( Params)->
+open( Params )->
   Options = #{
     dir := Dir
   } = ?OPTIONS( Params ),
@@ -195,91 +199,196 @@ open( Params)->
 
   try_open(Path, Options).
 
-try_open(Segment, Path, #{
-  options := Options,
-  attempts := Attempts
-} = Params ) when Attempts > 0->
+try_open(Path, #{
+  eleveldb := Params,
+  open_attempts := Attempts
+} = Options) when Attempts > 0->
 
-  ?LOGINFO("~p path ~p try open with options ~p",[Segment,Path,Options]),
-  case eleveldb:open(Path, Options) of
+  ?LOGINFO("~s try open with params ~p",[Path, Params]),
+  case eleveldb:open(Path, Params) of
     {ok, Ref} ->
-      ?LOGINFO("~p is ready ref ~p",[Segment,Ref]),
-      {ok, Ref};
+      #{
+        read := Read,
+        write := Write
+      } = Params,
+      #ref{ ref = Ref, read = maps:to_list(Read), write = maps:to_list(Write) };
     %% Check for open errors
     {error, {db_open, Error}} ->
       % Check for hanging lock
       case lists:prefix("IO error: lock ", Error) of
         true ->
-          ?LOGWARNING("~p unable to open, hanging lock, try to remove"),
+          ?LOGWARNING("~s unable to open, hanging lock, trying to unlock",[Path]),
           case file:delete(?LOCK(Path)) of
             ok->
-              ?LOGINFO("~p lock removed, retry"),
+              ?LOGINFO("~s lock removed, trying open",[ Path ]),
               % Dont decrement the attempt because we fixed the error ourselves
-              try_open(Segment,Path,Params)
+              try_open(Path,Options);
+            {error,UnlockError}->
+              ?LOGERROR("~s lock remove error ~p, try to remove it manually",[?LOCK(Path),UnlockError]),
+              throw(locked)
           end;
-        {error,UnlockError}->
-          ?LOGERROR("~p remove lock ~p error ~p, try to remove it first",[Segment,?LOCK(Path),UnlockError]),
-          throw(locked);
         false ->
-          ?LOGWARNING("~p open error ~p, try to repair left attempts ~p",[Segment,Error,Attempts-1]),
+          ?LOGWARNING("~s open error ~p, try to repair left attempts ~p",[Path,Error,Attempts-1]),
           try eleveldb:repair(Path, [])
           catch
             _:E:S->
-              ?LOGWARNING("~p repair attempt failed error ~p stack ~p, left attemps ~p",[Segment,E,S,Attempts-1]),
-              try_open(Segment,Path,Params#{ attempts => Attempts -1 })
-          end
+              ?LOGWARNING("~s repair attempt failed error ~p stack ~p, left attemps ~p",[Path,E,S,Attempts-1])
+          end,
+          try_open(Path,Options#{ open_attempts => Attempts -1 })
       end;
     {error, Other} ->
-      ?LOGERROR("~p open error ~p, left attemps ~p",[Segment,Other,Attempts-1]),
-      try_open( Segment, Path, Params#{ attempts => Attempts -1 } )
+      ?LOGERROR("~s open error ~p, left attemps ~p",[Path,Other,Attempts-1]),
+      try_open( Path, Options#{ open_attempts => Attempts -1 } )
   end;
-try_open(Segment,Path,Params)->
-  ?LOGERROR("~p OPEN ERROR: path ~p params ~p",[Segment,Path,Params]),
+try_open(Path, #{eleveldb := Params})->
+  ?LOGERROR("~s OPEN ERROR: params ~p",[Path, Params]),
   throw(open_error).
 
-close( Ref )->
-  todo.
+close( #ref{ref = Ref} )->
+  case eleveldb:close( Ref ) of
+    ok -> ok;
+    {error,Error}-> throw( Error)
+  end.
 
+remove( Params )->
+  Options = #{
+    dir := Dir
+  } = ?OPTIONS( Params ),
+
+  Path = Dir ++"."++?EXT,
+  Attempts = ?DESTROY_ATTEMPTS,
+  try_remove( Path, Attempts,  Options ).
+
+try_remove( Path, Attempts, #{
+  eleveldb := Params
+} = Options) when Attempts >0 ->
+  case eleveldb:destroy( Path, Params ) of
+    ok->
+      file:del_dir(Path),
+      ?LOGINFO("~s removed",[Path]);
+    {error, {error_db_destroy, Error}} ->
+      case lists:prefix("IO error: lock ", Error) of
+        true ->
+          ?LOGWARNING("~s unable to remove, hanging lock, trying to unlock",[ Path ]),
+          case file:delete(?LOCK(Path)) of
+            ok->
+              ?LOGINFO("~s lock removed, trying to remove",[Path]),
+              % Dont decrement the attempt because we fixed the error ourselves
+              try_remove(Path,Attempts,Options);
+            {error,UnlockError}->
+              ?LOGERROR("~s lock remove error ~p, try to remove it manually",[?LOCK(Path),UnlockError]),
+              throw(locked)
+          end;
+        false ->
+          ?LOGWARNING("~s remove error ~p, try to repair left attempts ~p",[Path,Error,Attempts-1]),
+          try eleveldb:repair(Path, [])
+          catch
+            _:E:S->
+              ?LOGWARNING("~s repair attempt failed error ~p stack ~p, left attemps ~p",[Path,E,S,Attempts-1])
+          end,
+          try_remove(Path, Attempts -1, Options)
+      end;
+    {error, Error} ->
+      ?LOGWARNING("~s remove error ~p, try to repair left attempts ~p",[Path,Error,Attempts-1]),
+      try eleveldb:repair(Path, [])
+      catch
+        _:E:S->
+          ?LOGWARNING("~s repair attempt failed error ~p stack ~p, left attemps ~p",[Path,E,S,Attempts-1])
+      end,
+      try_remove(Path, Attempts -1, Options)
+  end;
+try_remove(Path, 0, #{eleveldb := Params})->
+  ?LOGERROR("~s REMOVE ERROR: params ~p",[Path, Params]),
+  throw(remove_error).
 
 %%=================================================================
-%%	READ/WRITE
+%%	LOW_LEVEL
 %%=================================================================
-read(Segment, Keys)->
-  ok.
+read(#ref{ref = Ref, read = Params}=R, [Key|Rest])->
+  case eleveldb:get(Ref, ?ENCODE_KEY(Key), Params) of
+    {ok, Value} ->
+      [{Key,?DECODE_VALUE(Value)} | read(R,Rest) ];
+    _->
+      read(R, Rest)
+  end;
+read(_R,[])->
+  [].
 
-write(Segment,Records)->
+write(#ref{ref = Ref, write = Params}, KVs)->
+  case eleveldb:write(Ref,[{put,?ENCODE_KEY(K),?ENCODE_VALUE(V)} || {K,V} <- KVs ], Params) of
+    ok->ok;
+    {error,Error}->throw(Error)
+  end.
 
-  eleveldb:write(Ref,Batch, [{sync, Sync}]),
-  ok.
+delete(#ref{ref = Ref, write = Params},Keys)->
+  case eleveldb:write(Ref,[{delete,?ENCODE_KEY(K)} || K <- Keys], Params) of
+    ok -> ok;
+    {error, Error}-> throw(Error)
+  end.
 
-delete(Segment,Keys)->
-  Batch =
-    [case R of {put,K,_}->{delete,K};_-> R end || R <- Batch0],
-  eleveldb:write(Ref,Batch, [{sync, false}]),
-  ok.
 %%=================================================================
 %%	ITERATOR
 %%=================================================================
-first( Segment )->
-  ok.
+first( #ref{ref = Ref, read = Params} )->
+  {ok, Itr} = eleveldb:iterator(Ref, Params),
+  try
+    case eleveldb:iterator_move(Itr, first) of
+      {ok, K, V}->
+        { ?DECODE_KEY(K), ?DECODE_VALUE(V) };
+      {error, Error}->
+        throw(Error)
+    end
+  after
+    catch eleveldb:iterator_close(Itr)
+  end.
 
-last( Segment )->
-  ok.
+last( #ref{ref = Ref, read = Params} )->
+  {ok, Itr} = eleveldb:iterator(Ref, Params),
+  try
+    case eleveldb:iterator_move(Itr, last) of
+      {ok, K, V}->
+        { ?DECODE_KEY(K), ?DECODE_VALUE(V) };
+      {error, Error}->
+        throw(Error)
+    end
+  after
+    catch eleveldb:iterator_close(Itr)
+  end.
 
-next( Segment, K )->
-  ok.
+next( #ref{ref = Ref, read = Params}, K )->
+  Key = ?ENCODE_KEY(K),
+  {ok, Itr} = eleveldb:iterator(Ref, [{first_key, Key}|Params]),
+  try
+    case eleveldb:iterator_move(Itr, next) of
+      {ok, K, V}->
+        { ?DECODE_KEY(K), ?DECODE_VALUE(V) };
+      {error, Error}->
+        throw(Error)
+    end
+  after
+    catch eleveldb:iterator_close(Itr)
+  end.
 
-prev( Segment, K )->
-  ok.
+prev( #ref{ref = Ref, read = Params}, K )->
+  Key = ?ENCODE_KEY(K),
+  {ok, Itr} = eleveldb:iterator(Ref, [{first_key, Key}|Params]),
+  try
+    case eleveldb:iterator_move(Itr, prev) of
+      {ok, K, V}->
+        { ?DECODE_KEY(K), ?DECODE_VALUE(V) };
+      {error, Error}->
+        throw(Error)
+    end
+  after
+    catch eleveldb:iterator_close(Itr)
+  end.
 
 %%=================================================================
-%%	SEARCH
+%%	HIGH-LEVEL API
 %%=================================================================
-search(Segment,#{
-  start := Start,
-  stop := Stop,
-  ms := MS
-})->
+-record(query,{start, stop, ms}).
+find(#ref{ref = Ref, read = Params}, Query)->
+
   ok.
 
 match( Segment, Pattern )->
