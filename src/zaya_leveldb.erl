@@ -8,7 +8,7 @@
   %compression_algorithm => todo,
   open_options=>#{
     create_if_missing => false,
-    error_if_exists => false,
+    %error_if_exists => false,
     %write_buffer_size => todo
     %sst_block_size => todo,
     %block_restart_interval = todo,
@@ -40,16 +40,20 @@
     %iterator_refresh =todo
   },
   write => #{
-    sync => false
+    sync => true
   }
+}).
+
+-define(DEFAULT_OPTIONS,#{
+    dir => ".",
+    open_attempts => ?DEFAULT_OPEN_ATTEMPTS ,
+    eleveldb => ?DEFAULT_ELEVELDB_OPTIONS
 }).
 -define(env(K,D), application:get_env(zaya_leveldb,K,D)).
 
+
 -define(OPTIONS(O),
-  #{
-    open_attempts => maps:get(open_attempts,O, ?env(open_attempts,?DEFAULT_OPEN_ATTEMPTS) ) ,
-    eleveldb =>maps:get(eleveldb,O, ?env(eleveldb,?DEFAULT_ELEVELDB_OPTIONS) )
-  }
+  maps_merge(?DEFAULT_OPTIONS, O)
 ).
 
 -define(EXT,"leveldb").
@@ -59,12 +63,6 @@
 -define(ENCODE_KEY(K), sext:encode(K) ).
 -define(DECODE_VALUE(V), binary_to_term(V) ).
 -define(ENCODE_VALUE(V), term_to_binary(V) ).
-
--define(MOVE(I,K),eleveldb:iterator_move(I,K)).
--define(NEXT(I),eleveldb:iterator_move(I,next)).
--define(PREV(I),eleveldb:iterator_move(I,prev)).
-
--define(MAX_SEARCH_SIZE,1 bsl 128).
 
 -ifndef(TEST).
 
@@ -150,32 +148,11 @@
 create( Params )->
   Options = #{
     dir := Dir
-  } = ?OPTIONS( Params ),
+  } = ?OPTIONS( maps_merge(Params, #{eleveldb => #{open_options => #{ create_if_missing => true }}}) ),
 
   Path = Dir ++"."++?EXT,
 
-  case filelib:is_dir( Path ) of
-    false->
-      ok;
-    true->
-      ?LOGERROR("~s directory already exists, try to remove it first",[Path]),
-      throw(dir_already_exists)
-  end,
-
-  case filelib:is_file( Path ) of
-    false->
-      ok;
-    true->
-      ?LOGERROR("~s file already exists, try to remove it first",[Path]),
-      throw(dir_is_file)
-  end,
-
-  case filelib:ensure_dir( Path ) of
-    ok->ok;
-    {error, Error}->
-      ?LOGERROR("~s unable create error ~p",[Path,Error]),
-      throw(unavailable_dir)
-  end,
+  ensure_dir( Path ),
 
   Ref = try_open(Path, Options),
   close( Ref ),
@@ -200,17 +177,17 @@ open( Params )->
   try_open(Path, Options).
 
 try_open(Path, #{
-  eleveldb := Params,
+  eleveldb := #{
+    open_options := Params,
+    read := Read,
+    write := Write
+  },
   open_attempts := Attempts
 } = Options) when Attempts > 0->
 
   ?LOGINFO("~s try open with params ~p",[Path, Params]),
-  case eleveldb:open(Path, Params) of
+  case eleveldb:open(Path, maps:to_list(Params)) of
     {ok, Ref} ->
-      #{
-        read := Read,
-        write := Write
-      } = Params,
       #ref{
         ref = Ref,
         read = maps:to_list(Read),
@@ -360,12 +337,19 @@ last( #ref{ref = Ref, read = Params} )->
     catch eleveldb:iterator_close(Itr)
   end.
 
-next( #ref{ref = Ref, read = Params}, K )->
-  Key = ?ENCODE_KEY(K),
-  {ok, Itr} = eleveldb:iterator(Ref, [{first_key, Key}|Params]),
+next( #ref{ref = Ref, read = Params}, K0 )->
+  Key = ?ENCODE_KEY(K0),
+  {ok, Itr} = eleveldb:iterator(Ref, Params),
   try
-    case eleveldb:iterator_move(Itr, next) of
-      {ok, K, V}->
+    case eleveldb:iterator_move(Itr, Key) of
+      {ok, Key, _}->
+        case eleveldb:iterator_move( Itr, next ) of
+          {ok,K,V}->
+            { ?DECODE_KEY(K), ?DECODE_VALUE(V) };
+          {error,Error}->
+            throw( Error )
+        end;
+      {ok,K,V}->
         { ?DECODE_KEY(K), ?DECODE_VALUE(V) };
       {error, Error}->
         throw(Error)
@@ -598,6 +582,53 @@ get_size( _R, 0 )->
 %%  todo.
 
 
+%%=================================================================
+%%	UTIL
+%%=================================================================
+maps_merge( Map1, Map2 )->
+  maps:fold(fun(K,V2,Acc)->
+    case Map1 of
+      #{K := V1} when is_map(V1),is_map(V2)->
+        Acc#{ K => maps_merge( V1,V2 ) };
+      _->
+        Acc#{ K => V2 }
+    end
+  end, Map1, Map2 ).
 
 
+ensure_dir( Path )->
+  case filelib:is_file( Path ) of
+    false->
+      case filelib:ensure_dir( Path++"/" ) of
+        ok -> ok;
+        {error,CreateError}->
+          ?LOGERROR("~s create error ~p",[ Path, CreateError ]),
+          throw({create_dir_error,CreateError})
+      end;
+    true->
+      remove_recursive( Path ),
+      ensure_dir( Path )
+  end.
 
+remove_recursive( Path )->
+  case filelib:is_dir( Path ) of
+    false->
+      case file:delete( Path ) of
+        ok->ok;
+        {error,DelError}->
+          ?LOGERROR("~s delete error ~p",[Path,DelError]),
+          throw({delete_error,DelError})
+      end;
+    true->
+      case file:list_dir_all( Path ) of
+        {ok,Files}->
+          [ remove_recursive(Path++"/"++F) || F <- Files ],
+          case file:del_dir( Path ) of
+            ok->
+              ok;
+            {error,DelError}->
+              ?LOGERROR("~s delete error ~p",[Path,DelError]),
+              throw({delete_error,DelError})
+          end
+      end
+  end.
