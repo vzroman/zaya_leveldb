@@ -358,15 +358,25 @@ next( #ref{ref = Ref, read = Params}, K0 )->
     catch eleveldb:iterator_close(Itr)
   end.
 
-prev( #ref{ref = Ref, read = Params}, K )->
-  Key = ?ENCODE_KEY(K),
-  {ok, Itr} = eleveldb:iterator(Ref, [{first_key, Key}|Params]),
+prev( #ref{ref = Ref, read = Params}, K0 )->
+  Key = ?ENCODE_KEY(K0),
+  {ok, Itr} = eleveldb:iterator(Ref, Params),
   try
-    case eleveldb:iterator_move(Itr, prev) of
-      {ok, K, V}->
-        { ?DECODE_KEY(K), ?DECODE_VALUE(V) };
-      {error, Error}->
-        throw(Error)
+    case eleveldb:iterator_move(Itr, Key) of
+      {ok,_,_}->
+        case eleveldb:iterator_move( Itr, prev ) of
+          {ok,K,V}->
+            { ?DECODE_KEY(K), ?DECODE_VALUE(V) };
+          {error,Error}->
+            throw( Error )
+        end;
+      {error, _}->
+        case eleveldb:iterator_move(Itr, last) of
+          {ok,K,V}->
+            { ?DECODE_KEY(K), ?DECODE_VALUE(V) };
+          {error,Error}->
+            throw( Error )
+        end
     end
   after
     catch eleveldb:iterator_close(Itr)
@@ -404,8 +414,8 @@ find(#ref{ref = Ref, read = Params}, Query)->
 iterate_query({ok,K,V}, Itr, Next, StopKey, MS ) when K =< StopKey->
   Rec = {?DECODE_KEY(K),?DECODE_VALUE(V) },
   case ets:match_spec_run([Rec], MS) of
-    [_]->
-      [Rec| iterate_query( eleveldb:iterator_move(Itr,Next), Itr, Next, StopKey, MS )];
+    [Res]->
+      [Res| iterate_query( eleveldb:iterator_move(Itr,Next), Itr, Next, StopKey, MS )];
     []->
       iterate_query( eleveldb:iterator_move(Itr,Next), Itr, Next, StopKey, MS )
   end;
@@ -420,8 +430,8 @@ iterate_stop(_, _Itr, _Next, _StopKey )->
 iterate_ms({ok,K,V}, Itr, Next, MS )->
   Rec = {?DECODE_KEY(K),?DECODE_VALUE(V) },
   case ets:match_spec_run([Rec], MS) of
-    [_]->
-      [Rec| iterate_ms( eleveldb:iterator_move(Itr,Next), Itr, Next, MS )];
+    [Res]->
+      [Res| iterate_ms( eleveldb:iterator_move(Itr,Next), Itr, Next, MS )];
     []->
       iterate_ms( eleveldb:iterator_move(Itr,Next), Itr, Next, MS )
   end;
@@ -446,8 +456,8 @@ foldl( #ref{ref = Ref, read = Params}, Query, UserFun, InAcc )->
         CompiledMS = ets:match_spec_compile(MS),
         fun(Rec,Acc)->
           case ets:match_spec_run([Rec], CompiledMS) of
-            [_]->
-              UserFun(Rec,Acc);
+            [Res]->
+              UserFun(Res,Acc);
             []->
               Acc
           end
@@ -493,8 +503,8 @@ foldr( #ref{ref = Ref, read = Params}, Query, UserFun, InAcc )->
         CompiledMS = ets:match_spec_compile(MS),
         fun(Rec,Acc)->
           case ets:match_spec_run([Rec], CompiledMS) of
-            [_]->
-              UserFun(Rec,Acc);
+            [Res]->
+              UserFun(Res,Acc);
             []->
               Acc
           end
