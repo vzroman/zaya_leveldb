@@ -49,11 +49,11 @@
     open_attempts => ?DEFAULT_OPEN_ATTEMPTS ,
     eleveldb => ?DEFAULT_ELEVELDB_OPTIONS
 }).
--define(env(K,D), application:get_env(zaya_leveldb,K,D)).
+-define(env, maps_merge(?DEFAULT_OPTIONS, maps:from_list(application:get_all_env(zaya_leveldb))) ).
 
 
 -define(OPTIONS(O),
-  maps_merge(?DEFAULT_OPTIONS, O)
+  maps_merge(?env, O)
 ).
 
 -define(EXT,"leveldb").
