@@ -396,14 +396,24 @@ find(#ref{ref = Ref, read = Params}, Query)->
   {ok, Itr} = eleveldb:iterator(Ref, [{first_key, StartKey}|Params]),
   try
     case Query of
-      #{ stop:=Stop, ms:= MS }->
+      #{ stop:=Stop, ms:= MS, limit:=Limit } when is_integer(Limit)->
         StopKey = ?ENCODE_KEY(Stop),
         CompiledMS = ets:match_spec_compile(MS),
-        iterate_query(eleveldb:iterator_move(Itr, StartKey), Itr, prefetch, StopKey, CompiledMS );
+        iterate_query(eleveldb:iterator_move(Itr, StartKey), Itr, prefetch, StopKey, CompiledMS, Limit );
+      #{ stop:=Stop, ms:= MS}->
+        StopKey = ?ENCODE_KEY(Stop),
+        CompiledMS = ets:match_spec_compile(MS),
+        iterate_ms_stop(eleveldb:iterator_move(Itr, StartKey), Itr, prefetch, StopKey, CompiledMS );
+      #{ stop:= Stop, limit := Limit } when is_integer(Limit)->
+        iterate_stop_limit(eleveldb:iterator_move(Itr, StartKey), Itr, prefetch, ?ENCODE_KEY(Stop), Limit );
       #{ stop:= Stop }->
         iterate_stop(eleveldb:iterator_move(Itr, StartKey), Itr, prefetch, ?ENCODE_KEY(Stop) );
+      #{ms:= MS, limit := Limit} when is_integer(Limit)->
+        iterate_ms_limit(eleveldb:iterator_move(Itr, StartKey), Itr, prefetch, ets:match_spec_compile(MS), Limit );
       #{ms:= MS}->
         iterate_ms(eleveldb:iterator_move(Itr, StartKey), Itr, prefetch, ets:match_spec_compile(MS) );
+      #{limit := Limit} when is_integer(Limit)->
+        iterate_limit(eleveldb:iterator_move(Itr, StartKey), Itr, prefetch, Limit );
       _->
         iterate(eleveldb:iterator_move(Itr, StartKey), Itr, prefetch )
     end
@@ -411,20 +421,47 @@ find(#ref{ref = Ref, read = Params}, Query)->
     catch eleveldb:iterator_close(Itr)
   end.
 
-iterate_query({ok,K,V}, Itr, Next, StopKey, MS ) when K =< StopKey->
+iterate_query({ok,K,V}, Itr, Next, StopKey, MS, Limit ) when K =< StopKey, Limit > 0->
   Rec = {?DECODE_KEY(K),?DECODE_VALUE(V) },
   case ets:match_spec_run([Rec], MS) of
     [Res]->
-      [Res| iterate_query( eleveldb:iterator_move(Itr,Next), Itr, Next, StopKey, MS )];
+      [Res| iterate_query( eleveldb:iterator_move(Itr,Next), Itr, Next, StopKey, MS, Limit - 1 )];
     []->
-      iterate_query( eleveldb:iterator_move(Itr,Next), Itr, Next, StopKey, MS )
+      iterate_query( eleveldb:iterator_move(Itr,Next), Itr, Next, StopKey, MS, Limit )
   end;
-iterate_query(_, _Itr, _Next, _StopKey, _MS )->
+iterate_query(_, _Itr, _Next, _StopKey, _MS, _Limit )->
+  [].
+
+iterate_ms_stop({ok,K,V}, Itr, Next, StopKey, MS ) when K =< StopKey->
+  Rec = {?DECODE_KEY(K),?DECODE_VALUE(V) },
+  case ets:match_spec_run([Rec], MS) of
+    [Res]->
+      [Res| iterate_ms_stop( eleveldb:iterator_move(Itr,Next), Itr, Next, StopKey, MS )];
+    []->
+      iterate_ms_stop( eleveldb:iterator_move(Itr,Next), Itr, Next, StopKey, MS )
+  end;
+iterate_ms_stop(_, _Itr, _Next, _StopKey, _MS )->
+  [].
+
+iterate_stop_limit({ok,K,V}, Itr, Next, StopKey, Limit ) when K =< StopKey, Limit > 0->
+  [{?DECODE_KEY(K),?DECODE_VALUE(V) }| iterate_stop_limit( eleveldb:iterator_move(Itr,Next), Itr, Next, StopKey, Limit -1 )];
+iterate_stop_limit(_, _Itr, _Next, _StopKey, _Limit )->
   [].
 
 iterate_stop({ok,K,V}, Itr, Next, StopKey ) when K =< StopKey->
   [{?DECODE_KEY(K),?DECODE_VALUE(V) }| iterate_stop( eleveldb:iterator_move(Itr,Next), Itr, Next, StopKey )];
 iterate_stop(_, _Itr, _Next, _StopKey )->
+  [].
+
+iterate_ms_limit({ok,K,V}, Itr, Next, MS, Limit ) when Limit >0->
+  Rec = {?DECODE_KEY(K),?DECODE_VALUE(V) },
+  case ets:match_spec_run([Rec], MS) of
+    [Res]->
+      [Res| iterate_ms_limit( eleveldb:iterator_move(Itr,Next), Itr, Next, MS, Limit - 1 )];
+    []->
+      iterate_ms_limit( eleveldb:iterator_move(Itr,Next), Itr, Next, MS, Limit )
+  end;
+iterate_ms_limit(_, _Itr, _Next, _MS, _Limit )->
   [].
 
 iterate_ms({ok,K,V}, Itr, Next, MS )->
@@ -436,6 +473,11 @@ iterate_ms({ok,K,V}, Itr, Next, MS )->
       iterate_ms( eleveldb:iterator_move(Itr,Next), Itr, Next, MS )
   end;
 iterate_ms(_, _Itr, _Next, _MS )->
+  [].
+
+iterate_limit({ok,K,V}, Itr, Next, Limit) when Limit >0->
+  [{?DECODE_KEY(K),?DECODE_VALUE(V) } | iterate_limit( eleveldb:iterator_move(Itr,Next), Itr, Next, Limit-1 ) ];
+iterate_limit(_, _Itr, _Next, _Limit )->
   [].
 
 iterate({ok,K,V}, Itr, Next)->
@@ -474,6 +516,8 @@ foldl( #ref{ref = Ref, read = Params}, Query, UserFun, InAcc )->
       _->
         do_foldl( eleveldb:iterator_move(Itr, StartKey), Itr, Fun, InAcc )
     end
+  catch
+    {stop,Acc}->Acc
   after
     catch eleveldb:iterator_close(Itr)
   end.
@@ -521,6 +565,8 @@ foldr( #ref{ref = Ref, read = Params}, Query, UserFun, InAcc )->
       _->
         do_foldr( eleveldb:iterator_move(Itr, StartKey), Itr, Fun, InAcc )
     end
+  catch
+    {stop,Acc}-> Acc
   after
     catch eleveldb:iterator_close(Itr)
   end.
