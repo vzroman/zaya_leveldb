@@ -56,7 +56,6 @@
   maps_merge(?env, O)
 ).
 
--define(EXT,"leveldb").
 -define(LOCK(P),P++"/LOCK").
 
 -define(DECODE_KEY(K), sext:decode(K) ).
@@ -150,11 +149,9 @@ create( Params )->
     dir := Dir
   } = ?OPTIONS( maps_merge(Params, #{eleveldb => #{open_options => #{ create_if_missing => true }}}) ),
 
-  Path = Dir ++"."++?EXT,
+  ensure_dir( Dir ),
 
-  ensure_dir( Path ),
-
-  Ref = try_open(Path, Options),
+  Ref = try_open(Dir, Options),
   close( Ref ),
 
   ok.
@@ -164,19 +161,17 @@ open( Params )->
     dir := Dir
   } = ?OPTIONS( Params ),
 
-  Path = Dir ++"."++?EXT,
-
-  case filelib:is_dir( Path ) of
+  case filelib:is_dir( Dir ) of
     true->
       ok;
     false->
-      ?LOGERROR("~s doesn't exist",[ Path ]),
+      ?LOGERROR("~s doesn't exist",[ Dir ]),
       throw(not_exists)
   end,
 
-  try_open(Path, Options).
+  try_open(Dir, Options).
 
-try_open(Path, #{
+try_open(Dir, #{
   eleveldb := #{
     open_options := Params,
     read := Read,
@@ -185,45 +180,45 @@ try_open(Path, #{
   open_attempts := Attempts
 } = Options) when Attempts > 0->
 
-  ?LOGINFO("~s try open with params ~p",[Path, Params]),
-  case eleveldb:open(Path, maps:to_list(Params)) of
+  ?LOGINFO("~s try open with params ~p",[Dir, Params]),
+  case eleveldb:open(Dir, maps:to_list(Params)) of
     {ok, Ref} ->
       #ref{
         ref = Ref,
         read = maps:to_list(Read),
         write = maps:to_list(Write),
-        dir = Path
+        dir = Dir
       };
     %% Check for open errors
     {error, {db_open, Error}} ->
       % Check for hanging lock
       case lists:prefix("IO error: lock ", Error) of
         true ->
-          ?LOGWARNING("~s unable to open, hanging lock, trying to unlock",[Path]),
-          case file:delete(?LOCK(Path)) of
+          ?LOGWARNING("~s unable to open, hanging lock, trying to unlock",[Dir]),
+          case file:delete(?LOCK(Dir)) of
             ok->
-              ?LOGINFO("~s lock removed, trying open",[ Path ]),
+              ?LOGINFO("~s lock removed, trying open",[ Dir ]),
               % Dont decrement the attempt because we fixed the error ourselves
-              try_open(Path,Options);
+              try_open(Dir,Options);
             {error,UnlockError}->
-              ?LOGERROR("~s lock remove error ~p, try to remove it manually",[?LOCK(Path),UnlockError]),
+              ?LOGERROR("~s lock remove error ~p, try to remove it manually",[?LOCK(Dir),UnlockError]),
               throw(locked)
           end;
         false ->
-          ?LOGWARNING("~s open error ~p, try to repair left attempts ~p",[Path,Error,Attempts-1]),
-          try eleveldb:repair(Path, [])
+          ?LOGWARNING("~s open error ~p, try to repair left attempts ~p",[Dir,Error,Attempts-1]),
+          try eleveldb:repair(Dir, [])
           catch
             _:E:S->
-              ?LOGWARNING("~s repair attempt failed error ~p stack ~p, left attemps ~p",[Path,E,S,Attempts-1])
+              ?LOGWARNING("~s repair attempt failed error ~p stack ~p, left attemps ~p",[Dir,E,S,Attempts-1])
           end,
-          try_open(Path,Options#{ open_attempts => Attempts -1 })
+          try_open(Dir,Options#{ open_attempts => Attempts -1 })
       end;
     {error, Other} ->
-      ?LOGERROR("~s open error ~p, left attemps ~p",[Path,Other,Attempts-1]),
-      try_open( Path, Options#{ open_attempts => Attempts -1 } )
+      ?LOGERROR("~s open error ~p, left attemps ~p",[Dir,Other,Attempts-1]),
+      try_open( Dir, Options#{ open_attempts => Attempts -1 } )
   end;
-try_open(Path, #{eleveldb := Params})->
-  ?LOGERROR("~s OPEN ERROR: params ~p",[Path, Params]),
+try_open(Dir, #{eleveldb := Params})->
+  ?LOGERROR("~s OPEN ERROR: params ~p",[Dir, Params]),
   throw(open_error).
 
 close( #ref{ref = Ref} )->
@@ -237,50 +232,49 @@ remove( Params )->
     dir := Dir
   } = ?OPTIONS( Params ),
 
-  Path = Dir ++"."++?EXT,
   Attempts = ?DESTROY_ATTEMPTS,
-  try_remove( Path, Attempts,  Options ).
+  try_remove( Dir, Attempts,  Options ).
 
-try_remove( Path, Attempts, #{
+try_remove( Dir, Attempts, #{
   eleveldb := Params
 } = Options) when Attempts >0 ->
-  case eleveldb:destroy( Path, Params ) of
+  case eleveldb:destroy( Dir, Params ) of
     ok->
-      file:del_dir(Path),
-      ?LOGINFO("~s removed",[Path]);
+      file:del_dir(Dir),
+      ?LOGINFO("~s removed",[Dir]);
     {error, {error_db_destroy, Error}} ->
       case lists:prefix("IO error: lock ", Error) of
         true ->
-          ?LOGWARNING("~s unable to remove, hanging lock, trying to unlock",[ Path ]),
-          case file:delete(?LOCK(Path)) of
+          ?LOGWARNING("~s unable to remove, hanging lock, trying to unlock",[ Dir ]),
+          case file:delete(?LOCK(Dir)) of
             ok->
-              ?LOGINFO("~s lock removed, trying to remove",[Path]),
+              ?LOGINFO("~s lock removed, trying to remove",[Dir]),
               % Dont decrement the attempt because we fixed the error ourselves
-              try_remove(Path,Attempts,Options);
+              try_remove(Dir,Attempts,Options);
             {error,UnlockError}->
-              ?LOGERROR("~s lock remove error ~p, try to remove it manually",[?LOCK(Path),UnlockError]),
+              ?LOGERROR("~s lock remove error ~p, try to remove it manually",[?LOCK(Dir),UnlockError]),
               throw(locked)
           end;
         false ->
-          ?LOGWARNING("~s remove error ~p, try to repair left attempts ~p",[Path,Error,Attempts-1]),
-          try eleveldb:repair(Path, [])
+          ?LOGWARNING("~s remove error ~p, try to repair left attempts ~p",[Dir,Error,Attempts-1]),
+          try eleveldb:repair(Dir, [])
           catch
             _:E:S->
-              ?LOGWARNING("~s repair attempt failed error ~p stack ~p, left attemps ~p",[Path,E,S,Attempts-1])
+              ?LOGWARNING("~s repair attempt failed error ~p stack ~p, left attemps ~p",[Dir,E,S,Attempts-1])
           end,
-          try_remove(Path, Attempts -1, Options)
+          try_remove(Dir, Attempts -1, Options)
       end;
     {error, Error} ->
-      ?LOGWARNING("~s remove error ~p, try to repair left attempts ~p",[Path,Error,Attempts-1]),
-      try eleveldb:repair(Path, [])
+      ?LOGWARNING("~s remove error ~p, try to repair left attempts ~p",[Dir,Error,Attempts-1]),
+      try eleveldb:repair(Dir, [])
       catch
         _:E:S->
-          ?LOGWARNING("~s repair attempt failed error ~p stack ~p, left attemps ~p",[Path,E,S,Attempts-1])
+          ?LOGWARNING("~s repair attempt failed error ~p stack ~p, left attemps ~p",[Dir,E,S,Attempts-1])
       end,
-      try_remove(Path, Attempts -1, Options)
+      try_remove(Dir, Attempts -1, Options)
   end;
-try_remove(Path, 0, #{eleveldb := Params})->
-  ?LOGERROR("~s REMOVE ERROR: params ~p",[Path, Params]),
+try_remove(Dir, 0, #{eleveldb := Params})->
+  ?LOGERROR("~s REMOVE ERROR: params ~p",[Dir, Params]),
   throw(remove_error).
 
 %%=================================================================
