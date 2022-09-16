@@ -390,7 +390,7 @@ find(#ref{ref = Ref, read = Params}, Query)->
   {ok, Itr} = eleveldb:iterator(Ref, [{first_key, StartKey}|Params]),
   try
     case Query of
-      #{ stop:=Stop, ms:= MS, limit:=Limit } when is_integer(Limit)->
+      #{ stop:=Stop, ms:= MS, limit:=Limit }->
         StopKey = ?ENCODE_KEY(Stop),
         CompiledMS = ets:match_spec_compile(MS),
         iterate_query(eleveldb:iterator_move(Itr, StartKey), Itr, prefetch, StopKey, CompiledMS, Limit );
@@ -398,15 +398,15 @@ find(#ref{ref = Ref, read = Params}, Query)->
         StopKey = ?ENCODE_KEY(Stop),
         CompiledMS = ets:match_spec_compile(MS),
         iterate_ms_stop(eleveldb:iterator_move(Itr, StartKey), Itr, prefetch, StopKey, CompiledMS );
-      #{ stop:= Stop, limit := Limit } when is_integer(Limit)->
+      #{ stop:= Stop, limit := Limit }->
         iterate_stop_limit(eleveldb:iterator_move(Itr, StartKey), Itr, prefetch, ?ENCODE_KEY(Stop), Limit );
       #{ stop:= Stop }->
         iterate_stop(eleveldb:iterator_move(Itr, StartKey), Itr, prefetch, ?ENCODE_KEY(Stop) );
-      #{ms:= MS, limit := Limit} when is_integer(Limit)->
+      #{ms:= MS, limit := Limit}->
         iterate_ms_limit(eleveldb:iterator_move(Itr, StartKey), Itr, prefetch, ets:match_spec_compile(MS), Limit );
       #{ms:= MS}->
         iterate_ms(eleveldb:iterator_move(Itr, StartKey), Itr, prefetch, ets:match_spec_compile(MS) );
-      #{limit := Limit} when is_integer(Limit)->
+      #{limit := Limit}->
         iterate_limit(eleveldb:iterator_move(Itr, StartKey), Itr, prefetch, Limit );
       _->
         iterate(eleveldb:iterator_move(Itr, StartKey), Itr, prefetch )
