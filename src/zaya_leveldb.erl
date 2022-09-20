@@ -600,39 +600,6 @@ get_size( _R, 0 )->
   -1.
 
 %%=================================================================
-%%	COPY
-%%=================================================================
-%%fold(#source{ref = Ref}, Iterator, Acc0)->
-%%  eleveldb:fold(Ref,Iterator, Acc0, [{first_key, first}]).
-%%
-%%write_batch(Batch, CopyRef)->
-%%  eleveldb:write(CopyRef,Batch, [{sync, true}]).
-%%
-%%drop_batch(Batch0,#source{ref = Ref})->
-%%  Batch =
-%%    [case R of {put,K,_}->{delete,K};_-> R end || R <- Batch0],
-%%  eleveldb:write(Ref,Batch, [{sync, false}]).
-%%
-%%action({K,V})->
-%%  {{put,K,V},size(K)+size(V)}.
-%%
-%%live_action({write, {K,V}})->
-%%  K1 = ?ENCODE_KEY(K),
-%%  {K1, {put, K1,?ENCODE_VALUE(V)} };
-%%live_action({delete,K})->
-%%  K1 = ?ENCODE_KEY(K),
-%%  {K1,{delete,K1}}.
-%%
-%%get_key({put,K,_V})->K;
-%%get_key({delete,K})->K.
-%%
-%%decode_key(K)->?DECODE_KEY(K).
-%%
-%%rollback_copy( Target )->
-%%  todo.
-
-
-%%=================================================================
 %%	UTIL
 %%=================================================================
 maps_merge( Map1, Map2 )->
