@@ -228,43 +228,12 @@ remove( Params )->
   Attempts = ?DESTROY_ATTEMPTS,
   try_remove( Dir, Attempts,  Options ).
 
-try_remove( Dir, Attempts, #{
-  eleveldb := Params
-} = Options) when Attempts >0 ->
-  case eleveldb:destroy( Dir, Params ) of
-    ok->
-      file:del_dir(Dir),
-      ?LOGINFO("~s removed",[Dir]);
-    {error, {error_db_destroy, Error}} ->
-      case lists:prefix("IO error: lock ", Error) of
-        true ->
-          ?LOGWARNING("~s unable to remove, hanging lock, trying to unlock",[ Dir ]),
-          case file:delete(?LOCK(Dir)) of
-            ok->
-              ?LOGINFO("~s lock removed, trying to remove",[Dir]),
-              % Dont decrement the attempt because we fixed the error ourselves
-              try_remove(Dir,Attempts,Options);
-            {error,UnlockError}->
-              ?LOGERROR("~s lock remove error ~p, try to remove it manually",[?LOCK(Dir),UnlockError]),
-              throw(locked)
-          end;
-        false ->
-          ?LOGWARNING("~s remove error ~p, try to repair left attempts ~p",[Dir,Error,Attempts-1]),
-          try eleveldb:repair(Dir, [])
-          catch
-            _:E:S->
-              ?LOGWARNING("~s repair attempt failed error ~p stack ~p, left attemps ~p",[Dir,E,S,Attempts-1])
-          end,
-          try_remove(Dir, Attempts -1, Options)
-      end;
-    {error, Error} ->
-      ?LOGWARNING("~s remove error ~p, try to repair left attempts ~p",[Dir,Error,Attempts-1]),
-      try eleveldb:repair(Dir, [])
-      catch
-        _:E:S->
-          ?LOGWARNING("~s repair attempt failed error ~p stack ~p, left attemps ~p",[Dir,E,S,Attempts-1])
-      end,
-      try_remove(Dir, Attempts -1, Options)
+try_remove( Dir, Attempts, Options) when Attempts >0 ->
+  try remove_recursive(Dir)
+  catch
+    _:E:S->
+      ?LOGERROR("~s remove error ~p stack ~p",[Dir,E,S]),
+      try_remove( Dir, Attempts -1, Options )
   end;
 try_remove(Dir, 0, #{eleveldb := Params})->
   ?LOGERROR("~s REMOVE ERROR: params ~p",[Dir, Params]),
