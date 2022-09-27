@@ -40,7 +40,7 @@
     %iterator_refresh =todo
   },
   write => #{
-    sync => true
+    sync => false
   }
 }).
 
