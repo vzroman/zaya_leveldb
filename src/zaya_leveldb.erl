@@ -592,11 +592,16 @@ ensure_dir( Path )->
 remove_recursive( Path )->
   case filelib:is_dir( Path ) of
     false->
-      case file:delete( Path ) of
-        ok->ok;
-        {error,DelError}->
-          ?LOGERROR("~s delete error ~p",[Path,DelError]),
-          throw({delete_error,DelError})
+      case filelib:is_file( Path ) of
+        true->
+          case file:delete( Path ) of
+            ok->ok;
+            {error,DelError}->
+              ?LOGERROR("~s delete error ~p",[Path,DelError]),
+              throw({delete_error,DelError})
+          end;
+        _->
+          ok
       end;
     true->
       case file:list_dir_all( Path ) of
