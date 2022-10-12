@@ -144,10 +144,7 @@ create( Params )->
 
   ensure_dir( Dir ),
 
-  Ref = try_open(Dir, Options),
-  close( Ref ),
-
-  ok.
+  try_open(Dir, Options).
 
 open( Params )->
   Options = #{
