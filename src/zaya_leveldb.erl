@@ -22,7 +22,7 @@
     %total_leveldb_mem_percent => todo,
     %is_internal_db => todo,
     %limited_developer_mem => todo,
-    eleveldb_threads => 16
+    eleveldb_threads => 64
     %fadvise_willneed => TODO boolean()
     %block_cache_threshold => TODO pos_integer()
     %delete_threshold => pos_integer()
