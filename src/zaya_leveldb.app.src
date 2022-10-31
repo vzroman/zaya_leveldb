@@ -4,12 +4,13 @@
   {registered, []},
   {applications,
    [kernel,
-    stdlib
+    stdlib,
+    sext
    ]},
   {env,[]},
   {modules, []},
   {included_applications,[
-    sext
+
   ]},
   {licenses, ["MIT"]},
   {links, []}
