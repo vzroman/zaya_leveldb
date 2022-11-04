@@ -532,7 +532,7 @@ do_foldr_stop(_, _Itr, _Fun, Acc, _StopKey )->
 
 do_foldr( {ok,K,V}, Itr, Fun, InAcc )->
   Acc = Fun( {?DECODE_KEY(K), ?DECODE_VALUE(V)}, InAcc ),
-  do_foldl( eleveldb:iterator_move(Itr,prev), Itr, Fun, Acc  );
+  do_foldr( eleveldb:iterator_move(Itr,prev), Itr, Fun, Acc  );
 do_foldr(_, _Itr, _Fun, Acc )->
   Acc.
 
