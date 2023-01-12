@@ -1,5 +1,5 @@
 {application, zaya_leveldb,
- [{description, "LevelDb driver for zaya"},
+ [{description, "LevelDB driver for zaya"},
   {vsn, git},
   {registered, []},
   {applications,
