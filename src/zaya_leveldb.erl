@@ -127,6 +127,14 @@
 ]).
 
 %%=================================================================
+%%	COPY API
+%%=================================================================
+-export([
+  copy/3,
+  dump_batch/2
+]).
+
+%%=================================================================
 %%	INFO API
 %%=================================================================
 -export([
@@ -539,6 +547,31 @@ do_foldr( {ok,K,V}, Itr, Fun, InAcc )->
   do_foldr( eleveldb:iterator_move(Itr,prev), Itr, Fun, Acc  );
 do_foldr(_, _Itr, _Fun, Acc )->
   Acc.
+
+%%=================================================================
+%%	COPY
+%%=================================================================
+copy(#ref{ref = Ref, read = Params}, Fun, InAcc)->
+  {ok, Itr} = eleveldb:iterator(Ref, [{first_key, first}|Params]),
+  try
+    do_copy( eleveldb:iterator_move(Itr, first), Itr, Fun, InAcc )
+  catch
+    {stop,Acc}->Acc
+  after
+    catch eleveldb:iterator_close(Itr)
+  end.
+
+do_copy( {ok,K,V}, Itr, Fun, InAcc )->
+  Acc = Fun( {K, V}, InAcc ),
+  do_copy( eleveldb:iterator_move(Itr,prefetch), Itr, Fun, Acc  );
+do_copy(_, _Itr, _Fun, Acc )->
+  Acc.
+
+dump_batch(#ref{ref = Ref, write = Params}, KVs)->
+  case eleveldb:write(Ref,[{put,K,V} || {K,V} <- KVs ], Params) of
+    ok->ok;
+    {error,Error}->throw(Error)
+  end.
 
 %%=================================================================
 %%	INFO
