@@ -135,6 +135,16 @@
 ]).
 
 %%=================================================================
+%%	TRANSACTION API
+%%=================================================================
+-export([
+  transaction/1,
+  t_write/3,
+  commit/2,
+  rollback/2
+]).
+
+%%=================================================================
 %%	INFO API
 %%=================================================================
 -export([
@@ -572,6 +582,32 @@ dump_batch(#ref{ref = Ref, write = Params}, KVs)->
     ok->ok;
     {error,Error}->throw(Error)
   end.
+
+%%=================================================================
+%%	TRANSACTION API
+%%=================================================================
+transaction( _Ref )->
+  ets:new(?MODULE,[
+    private,
+    ordered_set,
+    {read_concurrency, true},
+    {write_concurrency, auto}
+  ]).
+
+t_write( _Ref, TransactionRef, KVs )->
+  ets:insert( TransactionRef, KVs ),
+  ok.
+
+commit(Ref, TransactionRef)->
+  try
+    write( Ref, ets:tab2list( TransactionRef ) )
+  after
+    ets:delete( TransactionRef )
+  end.
+
+rollback( _Ref, TransactionRef )->
+  ets:delete( TransactionRef ),
+  ok.
 
 %%=================================================================
 %%	INFO
