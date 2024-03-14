@@ -141,11 +141,8 @@
 %%	TRANSACTION API
 %%=================================================================
 -export([
-  transaction/1,
-  t_write/3,
-  t_delete/3,
-  commit/2,
-  commit1/2,
+  commit/3,
+  commit1/3,
   commit2/2,
   rollback/2
 ]).
@@ -627,91 +624,81 @@ dump_batch(#ref{ref = Ref, write = Params}, KVs)->
 %%=================================================================
 %%	TRANSACTION API
 %%=================================================================
-transaction( _Ref )->
-  ets:new(?MODULE,[
-    private,
-    ordered_set,
-    {read_concurrency, true},
-    {write_concurrency, auto}
-  ]).
+%%=================================================================
+%%	TRANSACTION API
+%%=================================================================
+commit( #ref{ ref = DRef,write = Params}, Write, Delete )->
+  Commit = prepare_commit( Write, Delete ),
+  ok = eleveldb:write( DRef, Commit, Params).
 
-t_write( _Ref, TRef, KVs )->
-  ets:insert( TRef, KVs ),
-  ok.
-
-t_delete( _Ref, TRef, Keys )->
-  ets:insert( TRef, [{K, ?none} || K <- Keys] ),
-  ok.
-
-commit(#ref{ref = Ref, write = Params}, TRef )->
-  Batch = write_delete( ets:tab2list( TRef ) ),
-  try
-    case eleveldb:write(Ref, Batch, Params) of
-      ok->ok;
-      {error,Error}->throw(Error)
-    end
-  after
-    ets:delete( TRef )
+commit1( #ref{ ref = DRef,log = Log ,write = Params} = Ref, Write, Delete )->
+  Commit = prepare_commit( Write, Delete ),
+  Rollback = prepare_rollback( Commit , Ref ),
+  if
+    length( Rollback ) =:=0-> ignore;
+    true ->
+      TRef = ?ENCODE_KEY( make_ref() ),
+      try
+        ok = eleveldb:write( Log, [ {put,TRef, ?ENCODE_VALUE(Rollback) }], Params),
+        ok = eleveldb:write( DRef, Commit, Params),
+        TRef
+      catch
+        _:E->
+          rollback( Ref, TRef ),
+          throw( E )
+      end
   end.
 
-commit1( #ref{ log = Log ,write = Params} = Ref, TRef )->
-  Rollback = prepare_rollback( ets:tab2list( TRef ), Ref ),
-  ok = eleveldb:write( Log, [ {put,?ROLLBACK_KEY(TRef),?ENCODE_VALUE(Rollback)}], Params),
-  try commit( Ref, TRef )
-  catch
-    _:E->
-      rollback( Ref, TRef ),
-      throw( E )
+commit2( #ref{log = Log, write = Params} , TRef )->
+  if
+    TRef =/= ignore ->
+      ok = eleveldb:write(Log, [{delete,TRef}], Params);
+    true ->
+      ok
   end.
-
-commit2( #ref{log = Log, write = Params} , TRef)->
-  eleveldb:write(Log, [{delete,?ROLLBACK_KEY(TRef)}], Params),
-  ok.
 
 rollback(#ref{ref =Ref, log = Log ,write = Params}, TRef )->
-  try
-    case eleveldb:get(Log, ?ROLLBACK_KEY(TRef), Params) of
-      {ok, Rollback} ->
-        eleveldb:write( Ref, ?DECODE_VALUE( Rollback ), Params ),
-        eleveldb:write(Log, [{delete,?ROLLBACK_KEY(TRef)}], Params);
-      _->
-        ignore
-    end
-  after
-    catch ets:delete( TRef )
+  case eleveldb:get(Log, TRef, Params) of
+    {ok, Rollback} ->
+      ok = eleveldb:write( Ref, ?DECODE_VALUE( Rollback ), Params ),
+      ok = eleveldb:write( Log, [{delete,TRef}], Params);
+    _->
+      ok
   end.
 
-prepare_rollback([{K0, ?none} | Rest ], #ref{ ref = DRef ,read = Params} = Ref)->
-  K = ?ENCODE_KEY(K0),
+prepare_commit([{K,V}|Rest], Delete )->
+  [{put,?ENCODE_KEY(K),?ENCODE_VALUE(V)} | prepare_commit(Rest, Delete) ];
+prepare_commit([], [K|Rest] )->
+  [{delete,?ENCODE_KEY(K)} | prepare_commit([], Rest) ];
+prepare_commit([], [])->
+  [].
+
+prepare_rollback([{put,K,V}|Rest], #ref{ ref = DRef ,read = Params} = Ref)->
   case eleveldb:get(DRef, K, Params) of
     {ok, V} ->
-      [{put, K, V} | prepare_rollback(Rest, Ref) ];
+      prepare_rollback(Rest, Ref);
+    {ok, V0} ->
+      [{put, K, V0} | prepare_rollback(Rest, Ref) ];
     _->
       [{delete, K} | prepare_rollback(Rest, Ref) ]
   end;
-prepare_rollback([{K0, _V} | Rest ], #ref{ ref = DRef ,write = Params} = Ref)->
-  K = ?ENCODE_KEY(K0),
+
+prepare_rollback([{delete, K}|Rest], #ref{ ref = DRef ,read = Params} = Ref)->
   case eleveldb:get(DRef, K, Params) of
     {ok, V} ->
       [{put, K, V} | prepare_rollback(Rest, Ref) ];
     _->
-      [{delete, K} | prepare_rollback(Rest, Ref) ]
+      prepare_rollback(Rest, Ref)
   end;
 prepare_rollback([], _Ref)->
   [].
 
 rollback_log( #ref{ ref = Ref, log = Log, read = ReadParams, write = WriteParams } )->
-  eleveldb:fold(Log, fun({K, Rollback}, _Acc)->
+  eleveldb:fold(Log, fun({TRef, Rollback}, _Acc)->
     eleveldb:write( Ref, ?DECODE_VALUE( Rollback ), WriteParams ),
-    eleveldb:write(Log, [{delete,K}], WriteParams)
+    eleveldb:write(Log, [{delete,TRef}], WriteParams)
   end, ok, ReadParams).
 
-write_delete([{K, ?none}|Rest])->
-  [{delete,?ENCODE_KEY(K)} |write_delete( Rest ) ];
-write_delete([{K,V}|Rest])->
-  [{put,?ENCODE_KEY(K),?ENCODE_VALUE(V)} |write_delete( Rest ) ];
-write_delete([])->
-  [].
 
 %%=================================================================
 %%	INFO
