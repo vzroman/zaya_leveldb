@@ -609,6 +609,7 @@ copy(#ref{ref = Ref, read = Params}, Fun, InAcc)->
     catch eleveldb:iterator_close(Itr)
   end.
 
+%% TODO. We need to release the iterator between batches because it can hog the memory
 do_copy( {ok,K,V}, Itr, Fun, InAcc )->
   Acc = Fun( {K, V}, InAcc ),
   do_copy( eleveldb:iterator_move(Itr,prefetch), Itr, Fun, Acc  );
