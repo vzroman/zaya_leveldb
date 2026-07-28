@@ -9,7 +9,7 @@
 -define(DEFAULT_ELEVELDB_OPTIONS,#{
   %compression_algorithm => todo,
   open_options=>#{
-    create_if_missing => false,
+    %create_if_missing => false,
     %error_if_exists => false,
     %write_buffer_size => todo
     %sst_block_size => todo,
@@ -48,6 +48,7 @@
 
 -define(DEFAULT_OPTIONS,#{
     dir => ".",
+    pool => #{},
     open_attempts => ?DEFAULT_OPEN_ATTEMPTS ,
     eleveldb => ?DEFAULT_ELEVELDB_OPTIONS
 }).
@@ -65,10 +66,6 @@
 -define(ENCODE_KEY(K), sext:encode(K) ).
 -define(DECODE_VALUE(V), binary_to_term(V) ).
 -define(ENCODE_VALUE(V), term_to_binary(V) ).
-
--define(ROLLBACK_KEY( Ref ),?ENCODE_KEY({rollback, ?MODULE, TRef})).
--define(none, {?MODULE, undefined}).
-
 
 %%=================================================================
 %%	SERVICE API
@@ -121,9 +118,15 @@
 %%=================================================================
 -export([
   commit/3,
-  commit1/3,
-  commit2/2,
-  rollback/2
+  prepare_rollback/3,
+  is_persistent/0
+]).
+
+%%=================================================================
+%%	POOL API
+%%=================================================================
+-export([
+  pool_batch/2
 ]).
 
 %%=================================================================
@@ -133,7 +136,13 @@
   get_size/1
 ]).
 
--record(ref,{ref,log,read,write,dir}).
+-record(ref,{
+  ref,
+  read,
+  write,
+  dir,
+  pool
+}).
 
 %%=================================================================
 %%	SERVICE
@@ -145,21 +154,34 @@ create( Params )->
       read := Read,
       write := Write
     }
-  } = ?OPTIONS( maps_merge(Params, #{eleveldb => #{open_options => #{ create_if_missing => true }}}) ),
+  } = ?OPTIONS(maps_merge(
+      Params,
+      #{
+        eleveldb => #{
+          open_options => #{
+            create_if_missing => true
+          }
+        }
+      }
+    )),
 
-  DataDir = Dir ++"/DATA",
-  LogDir = Dir++"/LOG",
+  ensure_dir( Dir ),
 
-  ensure_dir( DataDir ),
-  ensure_dir( LogDir ),
-
-  #ref{
-    ref = try_open(DataDir, Options),
-    log = try_open(LogDir, Options),
+  InitRef = #ref{
     read = maps:to_list(Read),
     write = maps:to_list(Write),
     dir = Dir
-  }.
+  },
+  case pipe(InitRef, [
+    fun(Ref)-> try_open(Ref, Options) end,
+    fun(Ref)-> open_pool(Ref, Options) end
+  ]) of
+    {ok, Ref}-> Ref;
+    {error, Error, Ref}->
+      catch close(Ref),
+      catch remove(Params),
+      throw(Error)
+  end.
 
 open( Params )->
   Options = #{
@@ -168,38 +190,41 @@ open( Params )->
       read := Read,
       write := Write
     }
-  } = ?OPTIONS( Params ),
+  } = ?OPTIONS(maps_merge(
+    Params,
+    #{
+      eleveldb => #{
+        open_options => #{
+          create_if_missing => false
+        }
+      }
+    }
+  )),
 
-  DataDir = Dir ++"/DATA",
-  LogDir = Dir++"/LOG",
-
-  case filelib:is_dir( DataDir ) of
+  case filelib:is_dir( Dir ) of
     true->
-      case filelib:is_dir( LogDir ) of
-        true -> ok;
-        false ->
-          ?LOGERROR("~s doesn't exist",[ LogDir ]),
-          throw(not_exists)
-      end,
       ok;
     false->
-      ?LOGERROR("~s doesn't exist",[ DataDir ]),
+      ?LOGERROR("~s doesn't exist",[ Dir ]),
       throw(not_exists)
   end,
 
-  Ref = #ref{
-    ref = try_open(DataDir, Options),
-    log = try_open(LogDir, Options),
+  InitRef = #ref{
     read = maps:to_list(Read),
     write = maps:to_list(Write),
     dir = Dir
   },
+  case pipe(InitRef, [
+    fun(Ref)-> try_open(Ref, Options) end,
+    fun(Ref)-> open_pool(Ref, Options) end
+  ]) of
+    {ok, Ref}-> Ref;
+    {error, Error, Ref}->
+      catch close(Ref),
+      throw(Error)
+  end.
 
-  rollback_log( Ref ),
-
-  Ref.
-
-try_open(Dir, #{
+try_open(Ref = #ref{dir = Dir}, #{
   eleveldb := #{
     open_options := Params
   },
@@ -208,8 +233,8 @@ try_open(Dir, #{
 
   ?LOGINFO("~s try open with params ~p",[Dir, Params]),
   case eleveldb:open(Dir, maps:to_list(Params)) of
-    {ok, Ref} ->
-      Ref;
+    {ok, DBRef} ->
+      Ref#ref{ref = DBRef};
     %% Check for open errors
     {error, {db_open, Error}} ->
       % Check for hanging lock
@@ -221,7 +246,7 @@ try_open(Dir, #{
               ?LOGINFO("~s lock removed, trying open",[ Dir ]),
               timer:sleep( ?RETRY_TIMEOUT ),
               % Dont decrement the attempt because we fixed the error ourselves
-              try_open(Dir,Options);
+              try_open(Ref, Options);
             {error,UnlockError}->
               ?LOGERROR("~s lock remove error ~p, try to remove it manually",[?LOCK(Dir),UnlockError]),
               throw(locked)
@@ -234,27 +259,21 @@ try_open(Dir, #{
               ?LOGWARNING("~s repair attempt failed error ~p stack ~p, left attemps ~p",[Dir,E,S,Attempts-1])
           end,
           timer:sleep( ?RETRY_TIMEOUT ),
-          try_open(Dir,Options#{ open_attempts => Attempts -1 })
+          try_open(Ref,Options#{ open_attempts => Attempts -1 })
       end;
     {error, Other} ->
       ?LOGERROR("~s open error ~p, left attemps ~p",[Dir,Other,Attempts-1]),
       timer:sleep( ?RETRY_TIMEOUT ),
-      try_open( Dir, Options#{ open_attempts => Attempts -1 } )
+      try_open(Ref, Options#{ open_attempts => Attempts -1 } )
   end;
-try_open(Dir, #{eleveldb := Params})->
+try_open(#ref{dir = Dir}, #{eleveldb := Params})->
   ?LOGERROR("~s OPEN ERROR: params ~p",[Dir, Params]),
   throw(open_error).
 
-close( #ref{ref = Ref, log = Log} )->
-  case eleveldb:close( Ref ) of
-    ok ->
-      case eleveldb:close( Log ) of
-        ok -> ok;
-        {error, Error} -> throw( Error)
-      end;
-    {error,Error}->
-      throw( Error)
-  end.
+close( #ref{ref = Ref, pool = Pool} )->
+  catch close_pool(Pool),
+  catch eleveldb:close( Ref ),
+  ok.
 
 remove( Params )->
   Options = #{
@@ -288,17 +307,31 @@ read(#ref{ref = Ref, read = Params}=R, [Key|Rest])->
 read(_R,[])->
   [].
 
-write(#ref{ref = Ref, write = Params}, KVs)->
-  case eleveldb:write(Ref,[{put,?ENCODE_KEY(K),?ENCODE_VALUE(V)} || {K,V} <- KVs ], Params) of
+write(#ref{ref = Ref, write = Params, pool = disabled}, KVs)->
+  Ops = prepare_write(KVs),
+  case eleveldb:write(Ref, Ops, Params) of
     ok->ok;
     {error,Error}->throw(Error)
-  end.
+  end;
+write(#ref{pool = Pool}, KVs)->
+  Ops = prepare_write(KVs),
+  zaya_pool:call(Pool, [{batch, Ops}]).
 
-delete(#ref{ref = Ref, write = Params},Keys)->
-  case eleveldb:write(Ref,[{delete,?ENCODE_KEY(K)} || K <- Keys], Params) of
+prepare_write(KVs)->
+  [{put,?ENCODE_KEY(K),?ENCODE_VALUE(V)} || {K,V} <- KVs].
+
+delete(#ref{ref = Ref, write = Params, pool = disabled},Keys)->
+  Ops = prepare_delete(Keys),
+  case eleveldb:write(Ref, Ops, Params) of
     ok -> ok;
     {error, Error}-> throw(Error)
-  end.
+  end;
+delete(#ref{pool = Pool}, Keys)->
+  Ops = prepare_delete(Keys),
+  zaya_pool:call(Pool, [{batch, Ops}]).
+
+prepare_delete(Keys)->
+  [{delete,?ENCODE_KEY(K)} || K <- Keys].
 
 %%=================================================================
 %%	ITERATOR
@@ -604,47 +637,12 @@ dump_batch(#ref{ref = Ref, write = Params}, KVs)->
 %%=================================================================
 %%	TRANSACTION API
 %%=================================================================
-%%=================================================================
-%%	TRANSACTION API
-%%=================================================================
-commit( #ref{ ref = DRef,write = Params}, Write, Delete )->
+commit( #ref{ ref = DRef, write = Params, pool = disabled}, Write, Delete )->
   Commit = prepare_commit( Write, Delete ),
-  ok = eleveldb:write( DRef, Commit, Params).
-
-commit1( #ref{ ref = DRef,log = Log ,write = Params} = Ref, Write, Delete )->
+  ok = eleveldb:write( DRef, Commit, Params);
+commit( #ref{ pool = Pool}, Write, Delete )->
   Commit = prepare_commit( Write, Delete ),
-  Rollback = prepare_rollback( Commit , Ref ),
-  if
-    length( Rollback ) =:=0-> ignore;
-    true ->
-      TRef = ?ENCODE_KEY( make_ref() ),
-      try
-        ok = eleveldb:write( Log, [ {put,TRef, ?ENCODE_VALUE(Rollback) }], Params),
-        ok = eleveldb:write( DRef, Commit, Params),
-        TRef
-      catch
-        _:E->
-          rollback( Ref, TRef ),
-          throw( E )
-      end
-  end.
-
-commit2( #ref{log = Log, write = Params} , TRef )->
-  if
-    TRef =/= ignore ->
-      ok = eleveldb:write(Log, [{delete,TRef}], Params);
-    true ->
-      ok
-  end.
-
-rollback(#ref{ref =Ref, log = Log ,write = Params}, TRef )->
-  case eleveldb:get(Log, TRef, Params) of
-    {ok, Rollback} ->
-      ok = eleveldb:write( Ref, ?DECODE_VALUE( Rollback ), Params ),
-      ok = eleveldb:write( Log, [{delete,TRef}], Params);
-    _->
-      ok
-  end.
+  zaya_pool:call(Pool, [{batch, Commit}]).
 
 prepare_commit([{K,V}|Rest], Delete )->
   [{put,?ENCODE_KEY(K),?ENCODE_VALUE(V)} | prepare_commit(Rest, Delete) ];
@@ -653,32 +651,56 @@ prepare_commit([], [K|Rest] )->
 prepare_commit([], [])->
   [].
 
-prepare_rollback([{put,K,V}|Rest], #ref{ ref = DRef ,read = Params} = Ref)->
-  case eleveldb:get(DRef, K, Params) of
-    {ok, V} ->
-      prepare_rollback(Rest, Ref);
-    {ok, V0} ->
-      [{put, K, V0} | prepare_rollback(Rest, Ref) ];
-    _->
-      [{delete, K} | prepare_rollback(Rest, Ref) ]
-  end;
+prepare_rollback(Ref, Write, Delete)->
+  {W_acc0, D_acc} = rollback_write(Write, Ref, {[], []}),
+  W_acc = rollback_delete(Delete, Ref, W_acc0),
+  {W_acc, D_acc}.
 
-prepare_rollback([{delete, K}|Rest], #ref{ ref = DRef ,read = Params} = Ref)->
-  case eleveldb:get(DRef, K, Params) of
-    {ok, V} ->
-      [{put, K, V} | prepare_rollback(Rest, Ref) ];
-    _->
-      prepare_rollback(Rest, Ref)
-  end;
-prepare_rollback([], _Ref)->
-  [].
+rollback_write(
+    [{K,V}|Rest],
+    Ref = #ref{ref = DBRef, read = Params},
+    Acc0 = {W_acc,D_acc}
+)->
+  Acc =
+    case eleveldb:get(DBRef, ?ENCODE_KEY(K), Params) of
+      {ok, V_enc}->
+        case ?DECODE_VALUE(V_enc) of
+          V -> Acc0;
+          V0-> {[{K,V0}|W_acc], D_acc}
+        end;
+      _->
+        {W_acc, [K|D_acc]}
+    end,
+  rollback_write(Rest, Ref, Acc);
+rollback_write([], _Ref, Acc)->
+  Acc.
 
-rollback_log( #ref{ ref = Ref, log = Log, read = ReadParams, write = WriteParams } )->
-  eleveldb:fold(Log, fun({TRef, Rollback}, _Acc)->
-    eleveldb:write( Ref, ?DECODE_VALUE( Rollback ), WriteParams ),
-    eleveldb:write(Log, [{delete,TRef}], WriteParams)
-  end, ok, ReadParams).
+rollback_delete(
+    [K|Rest],
+    Ref = #ref{ref = DBRef, read = Params},
+    Acc0
+)->
+  Acc =
+    case eleveldb:get(DBRef, ?ENCODE_KEY(K), Params) of
+      {ok, V} -> [{K, ?DECODE_VALUE(V)}|Acc0];
+      _-> Acc0
+    end,
+  rollback_delete(Rest, Ref, Acc);
+rollback_delete([], _Ref, Acc)->
+  Acc.
 
+is_persistent()->
+  true.
+
+%%=================================================================
+%%	POOL API
+%%=================================================================
+pool_batch({DRef, WriteParams}, Requests)->
+  Ops = lists:append([Batch || {batch, Batch} <- Requests]),
+  case eleveldb:write(DRef, Ops, WriteParams) of
+    ok -> ok;
+    {error, Error} -> throw(Error)
+  end.
 
 %%=================================================================
 %%	INFO
@@ -715,6 +737,40 @@ maps_merge( Map1, Map2 )->
     end
   end, Map1, Map2 ).
 
+
+%%=================================================================
+%%	UTILITIES
+%%=================================================================
+pipe(Ref, [Step | Rest])->
+  try Step(Ref) of
+    Ref1 -> pipe(Ref1, Rest)
+  catch _:Error ->
+    {error, Error, Ref}
+  end;
+pipe(Ref, [])->
+  {ok, Ref}.
+
+open_pool(Ref, #{pool := disabled})->
+  Ref#ref{pool = disabled};
+open_pool(Ref = #ref{ref = DRef, write = WriteParams}, Params)->
+  {ok, Pool} = zaya_pool:start_link(pool_params(DRef, WriteParams, Params)),
+  Ref#ref{pool = Pool}.
+
+close_pool(undefined)->
+  ok;
+close_pool(disabled)->
+  ok;
+close_pool(Pool)->
+  zaya_pool:stop(Pool).
+
+pool_params(DRef, WriteParams, Params)->
+  maps:merge(
+    maps:get(pool, Params, #{}),
+    #{
+      ref => {DRef, WriteParams},
+      module => ?MODULE
+    }
+  ).
 
 ensure_dir( Path )->
   case filelib:is_file( Path ) of

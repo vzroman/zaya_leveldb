@@ -6,7 +6,8 @@
    [kernel,
     stdlib,
     sext,
-    eleveldb
+    eleveldb,
+    zaya_pool
    ]},
   {env,[]},
   {modules, []},
